@@ -1,0 +1,13 @@
+{
+  "beam_width": 16,
+  "canonical": "A/a->A,C/c->C,G/g->G,T/t->T,other->N",
+  "config": "kmc_k9_b16_lognormal",
+  "execution_model": "CAUSAL_OFFLINE_STREAM_REPLAY",
+  "final_decode": "FinalOnlyExact",
+  "k": 9,
+  "length_prior": "lognormal",
+  "mode": "NO_STOP",
+  "seed_derivation": "sha256(acor|minimal|seed|dataset|cluster_id)[:16]",
+  "support_bonus": 0.15,
+  "version": "0.1.0"
+}

@@ -1,0 +1,12 @@
+{
+  "actual_completed_task_markers": 120,
+  "completed": 120,
+  "fixed_pairs": 50,
+  "ledger_rebuild_wall_s": 32.73305306956172,
+  "random_pairs": 10,
+  "retained_failed_attempt_markers": 1,
+  "status": "PASS",
+  "task_outer_wall_sum_s": 4124.577048447,
+  "total": 120,
+  "truth_only_clusters_excluded": 680
+}

@@ -1,0 +1,215 @@
+name: build-test-release
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: acor-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACOR_CI_SEED: 0123456789abcdef0123456789abcdef
+  ACOR_VERSION: 0.1.0
+
+jobs:
+  build-test:
+    name: ${{ matrix.name }} portable-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc
+            cc: gcc
+            cxx: g++
+            package: g++
+          - name: clang
+            cc: clang
+            cxx: clang++
+            package: clang
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake ninja-build python3 "${{ matrix.package }}"
+
+      - name: Reject bundled executables and audit source worktree
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -d scripts && test ! -L scripts
+          test -f scripts/verify_release.py && test ! -L scripts/verify_release.py
+          rm -f -- bin/acor_runner bin/ed_pairs
+          if [[ -d bin ]] && [[ -n "$(find bin -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+            echo "unexpected bundled bin member remains" >&2
+            exit 1
+          fi
+          rmdir bin 2>/dev/null || true
+          python3 -I scripts/verify_release.py --self-test
+          python3 -I scripts/verify_release.py --root "${GITHUB_WORKSPACE}" --worktree
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          set -Eeuo pipefail
+          cmake -S . -B "${RUNNER_TEMP}/acor-${{ matrix.name }}-build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DACOR_BUILD_PROFILE=portable-release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DBUILD_TESTING=ON
+
+      - name: Build and test
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          set -Eeuo pipefail
+          build_dir="${RUNNER_TEMP}/acor-${{ matrix.name }}-build"
+          cmake --build "${build_dir}" --parallel 2
+          ctest --test-dir "${build_dir}" --output-on-failure
+          python3 -I -c 'import json,pathlib,sys; rows=json.loads(pathlib.Path(sys.argv[1]).read_text()); cmds=[r["command"] for r in rows]; forbidden=("-march","-mtune","-flto"); ok=bool(cmds) and all("-O3" in c and "-DNDEBUG" in c for c in cmds) and not any(x in c for c in cmds for x in forbidden); print("PORTABLE_RELEASE_FLAGS=PASS") if ok else sys.exit("invalid portable compile commands")' "${build_dir}/compile_commands.json"
+          test_log="${build_dir}/Testing/Temporary/LastTest.log"
+          python3 -I -c 'import pathlib,re,sys; t=pathlib.Path(sys.argv[1]).read_text(); m=re.search(r"Ran (\d+) tests?",t); ok=bool(m) and int(m.group(1))>=12 and "test_seed_replay" in t and "test_cli" in t; print("UNITTEST_DISCOVERY=PASS count="+m.group(1)) if ok else sys.exit("required unittest discovery evidence missing")' "${test_log}"
+
+      - name: Smoke the just-built executables
+        run: |
+          set -Eeuo pipefail
+          build_dir="${RUNNER_TEMP}/acor-${{ matrix.name }}-build"
+          smoke_out="${RUNNER_TEMP}/acor-${{ matrix.name }}-smoke"
+          mkdir -p -- bin
+          install -m 0755 -- "${build_dir}/acor_runner" bin/acor_runner
+          install -m 0755 -- "${build_dir}/ed_pairs" bin/ed_pairs
+          python3 acor.py run \
+            --data tests/fixtures/tiny_aim \
+            --aim \
+            --threads 1 \
+            --seeds "${ACOR_CI_SEED}" \
+            --results "${smoke_out}"
+          test -s "$(find "${smoke_out}" -type f -name pred.tsv -print -quit)"
+          test -s "$(find "${smoke_out}" -type f -name SUMMARY.tsv -print -quit)"
+          pred="$(find "${smoke_out}" -type f -name pred.tsv -print -quit)"
+          summary="$(find "${smoke_out}" -type f -name SUMMARY.tsv -print -quit)"
+          cmp --silent "${pred}" tests/golden/tiny_fixed_pred.tsv
+          python3 -I -c 'import csv,sys; rows=list(csv.DictReader(open(sys.argv[1],encoding="utf-8"),delimiter="\t")); metrics=[float(rows[-1][k]) for k in ("exact","accuracy","mean_ed")] if rows else []; pred_lines=sum(1 for _ in open(sys.argv[2],encoding="utf-8")); ok=bool(rows) and len(metrics)==3 and pred_lines>1; print("SMOKE_METRICS=PASS") if ok else sys.exit("smoke metrics/prediction invalid")' "${summary}" "${pred}"
+          rm -f -- bin/acor_runner bin/ed_pairs
+          rmdir bin
+
+  archive-clean-room:
+    name: deterministic archives and clean-room consumer test
+    needs: build-test
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install release tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential cmake ninja-build python3
+
+      - name: Build deterministic source and binary archives
+        run: |
+          set -Eeuo pipefail
+          rm -f -- bin/acor_runner bin/ed_pairs
+          rmdir bin 2>/dev/null || true
+          bash scripts/make_release.sh
+
+      - name: Frozen reference flags are architecture-neutral and non-LTO
+        env:
+          CC: gcc
+          CXX: g++
+        run: |
+          set -Eeuo pipefail
+          frozen_build="${RUNNER_TEMP}/frozen-reference-build"
+          cmake -S . -B "${frozen_build}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DACOR_BUILD_PROFILE=frozen-compatible \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DBUILD_TESTING=OFF
+          cmake --build "${frozen_build}" --parallel 2
+          python3 -I -c 'import json,pathlib,sys; rows=json.loads(pathlib.Path(sys.argv[1]).read_text()); cmds=[r["command"] for r in rows]; forbidden=("-O3","-march","-mtune","-flto"); ok=bool(cmds) and all("-O2" in c and "-DNDEBUG" in c for c in cmds) and not any(x in c for c in cmds for x in forbidden); print("FROZEN_REFERENCE_FLAGS=PASS") if ok else sys.exit("invalid frozen-reference compile commands")' "${frozen_build}/compile_commands.json"
+          if cmake -S . -B "${RUNNER_TEMP}/frozen-forbidden-build" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DACOR_BUILD_PROFILE=frozen-compatible \
+              -DCMAKE_CXX_FLAGS=-march=native \
+              -DBUILD_TESTING=OFF; then
+            echo "frozen-compatible accepted forbidden -march" >&2
+            exit 1
+          fi
+          if CXXFLAGS=-march=native cmake -S . -B "${RUNNER_TEMP}/portable-forbidden-build" -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DACOR_BUILD_PROFILE=portable-release \
+              -DBUILD_TESTING=OFF; then
+            echo "portable-release accepted forbidden CXXFLAGS=-march=native" >&2
+            exit 1
+          fi
+
+      - name: Independently verify both archives
+        run: |
+          set -Eeuo pipefail
+          source_tar="release/acor-reconstruction-backbone-${ACOR_VERSION}-source.tar.gz"
+          binary_tar="release/acor-reconstruction-backbone-${ACOR_VERSION}-linux-x86_64.tar.gz"
+          sha256sum --check release/SHA256SUMS.txt
+          python3 -I scripts/verify_release.py --root "${GITHUB_WORKSPACE}" \
+            --source-tar "${source_tar}" --binary-tar "${binary_tar}"
+
+      - name: Empty-directory source archive build, test, and smoke
+        run: |
+          set -Eeuo pipefail
+          source_tar="${GITHUB_WORKSPACE}/release/acor-reconstruction-backbone-${ACOR_VERSION}-source.tar.gz"
+          unpack_root="${RUNNER_TEMP}/source-unpack"
+          build_dir="${RUNNER_TEMP}/source-archive-build"
+          smoke_out="${RUNNER_TEMP}/source-archive-smoke"
+          mkdir -p -- "${unpack_root}"
+          test -z "$(find "${unpack_root}" -mindepth 1 -print -quit)"
+          tar -xzf "${source_tar}" -C "${unpack_root}"
+          source_root="${unpack_root}/acor-reconstruction-backbone-${ACOR_VERSION}"
+          test -d "${source_root}"
+          test "$(find "${unpack_root}" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1
+          cmake -S "${source_root}" -B "${build_dir}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DACOR_BUILD_PROFILE=portable-release \
+            -DBUILD_TESTING=ON
+          cmake --build "${build_dir}" --parallel 2
+          ctest --test-dir "${build_dir}" --output-on-failure
+          mkdir -p -- "${source_root}/bin"
+          install -m 0755 -- "${build_dir}/acor_runner" "${source_root}/bin/acor_runner"
+          install -m 0755 -- "${build_dir}/ed_pairs" "${source_root}/bin/ed_pairs"
+          python3 "${source_root}/acor.py" run \
+            --data "${source_root}/tests/fixtures/tiny_aim" \
+            --aim --threads 1 --seeds "${ACOR_CI_SEED}" \
+            --results "${smoke_out}"
+          pred="$(find "${smoke_out}" -type f -name pred.tsv -print -quit)"
+          test -s "${pred}"
+          cmp --silent "${pred}" "${source_root}/tests/golden/tiny_fixed_pred.tsv"
+
+      - name: Empty-directory binary archive smoke
+        run: |
+          set -Eeuo pipefail
+          binary_tar="${GITHUB_WORKSPACE}/release/acor-reconstruction-backbone-${ACOR_VERSION}-linux-x86_64.tar.gz"
+          unpack_root="${RUNNER_TEMP}/binary-unpack"
+          smoke_out="${RUNNER_TEMP}/binary-archive-smoke"
+          mkdir -p -- "${unpack_root}"
+          test -z "$(find "${unpack_root}" -mindepth 1 -print -quit)"
+          tar -xzf "${binary_tar}" -C "${unpack_root}"
+          binary_root="${unpack_root}/acor-reconstruction-backbone-${ACOR_VERSION}"
+          test -x "${binary_root}/bin/acor_runner"
+          test -x "${binary_root}/bin/ed_pairs"
+          python3 "${binary_root}/acor.py" run \
+            --data "${binary_root}/tests/fixtures/tiny_aim" \
+            --aim --threads 1 --seeds "${ACOR_CI_SEED}" \
+            --results "${smoke_out}"
+          pred="$(find "${smoke_out}" -type f -name pred.tsv -print -quit)"
+          test -s "${pred}"
+          cmp --silent "${pred}" "${GITHUB_WORKSPACE}/tests/golden/tiny_fixed_pred.tsv"

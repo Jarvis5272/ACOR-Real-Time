@@ -1,0 +1,10 @@
+/build/
+/bin/acor_runner
+/bin/ed_pairs
+/bin/*_baseline
+/ACOR_RESULTS/
+/release/
+__pycache__/
+*.pyc
+*.tmp
+*.log

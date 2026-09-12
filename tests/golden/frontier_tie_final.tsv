@@ -1,0 +1,4 @@
+cluster_id	reconstructed_sequence
+tie_equal_starts	AAAAAAAAAAAA
+tie_shared_context	AAAAAAAAAAAA
+tie_symmetric	ACGTACGTACGA

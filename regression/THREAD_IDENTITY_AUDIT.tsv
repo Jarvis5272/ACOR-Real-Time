@@ -1,0 +1,11 @@
+dataset	thread_matrix	unique_canonical_prediction_hashes	unique_fixed_order_hashes	runner_threads_propagated	random_seed	random_order_regenerated	random_replay_order_sha_match	random_replay_prediction_sha_match	status
+oligo0	1,4,16,20,32	1	1	1	7d46154162d1eb85cdb1f231a908d76f	1	1	1	PASS
+ncomms19_365dishes	1,4,16,20,32	1	1	1	34348d0bd58eedafe04aabe12258dd25	1	1	1	PASS
+binned_nanopore	1,4,16,20,32	1	1	1	4490c2f3345aad26cf07f7032fd92301	1	1	1	PASS
+microsoft_cnr	1,4,16,20,32	1	1	1	29427e741956d4dae7e56d9a48e26c94	1	1	1	PASS
+trellisbma	1,4,16,20,32	1	1	1	8135b19435f4baf69200cebce8663a31	1	1	1	PASS
+dnaformer_nanopore	1,4,16,20,32	1	1	1	969cb36acb82e86ae29248bdd121d1c0	1	1	1	PASS
+dnaformer_illumina	1,4,16,20,32	1	1	1	347623f79bd6b0d704a53d8ad3cec129	1	1	1	PASS
+zenodo10943282	1,4,16,20,32	1	1	1	7dc5789b8602ccdd10543e318cddb7c3	1	1	1	PASS
+err1816980_fountain	1,4,16,20,32	1	1	1	202a51ddef09ce82e632edc8b421f6ae	1	1	1	PASS
+err1816980_official	1,4,16,20,32	1	1	1	0b00226c33413c9fbd05a71135e678d8	1	1	1	PASS
