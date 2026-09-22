@@ -1,5 +1,5 @@
 component	frozen_source_sha256	release_source	relation
-python_cli	3b1f00eeab20d7b3ea65bab6c3880229f67eee02df554a8077316203c3de9c17	acor.py	behavior-preserving engineering hardening
-runner	9acc4dc286859fa786202935c7d5affe53092e132af03dc70e53f1b9a055b04e	src/acor_runner.cpp	frozen algorithm plus metadata and boundary hardening
-kernel	debde33a5cab10fdde4ec63eb16d4bbe8399ca65ea5f2fce9b7003968eb2384e	src/acor_kernel.cpp	frozen algorithm plus boundary hardening and runtime interface separation
+python_cli	3b1f00eeab20d7b3ea65bab6c3880229f67eee02df554a8077316203c3de9c17	acor.py	v0.1-compatible defaults plus public k selection and backend audit
+runner	9acc4dc286859fa786202935c7d5affe53092e132af03dc70e53f1b9a055b04e	src/acor_runner.cpp	v0.1 algorithm plus persistent adaptive NUMA-aware scheduling
+kernel	debde33a5cab10fdde4ec63eb16d4bbe8399ca65ea5f2fce9b7003968eb2384e	src/acor_kernel.cpp	v0.1 algorithm plus exact sparse high-k evidence storage and merge
 evaluator	9c9e60bf16738b57458125c0ea16a41c71943bb9937e938d4d26c0cd30c33c3f	src/ed_pairs.cpp	byte-equivalent two-row implementation

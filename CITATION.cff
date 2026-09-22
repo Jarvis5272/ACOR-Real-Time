@@ -1,9 +1,9 @@
 cff-version: 1.2.0
 message: "If you use ACOR Reconstruction Backbone, please cite this software."
 title: "ACOR Reconstruction Backbone"
-version: 0.1.0
-date-released: 2026-08-22
+version: 0.2.0
+date-released: 2026-09-22
 authors:
   - family-names: "Jarvis5272"
 license: MIT
-repository-code: "https://github.com/Jarvis5272/ACOR"
+repository-code: "https://github.com/Jarvis5272/ACOR-Real-Time"

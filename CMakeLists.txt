@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(acor-reconstruction-backbone VERSION 0.1.0 LANGUAGES CXX)
+project(acor-reconstruction-backbone VERSION 0.2.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 include(CTest)
@@ -118,6 +118,13 @@ add_executable(ed_pairs
   src/ed_pairs.cpp
 )
 
+add_executable(test_ledger_reduction
+  tests/test_ledger_reduction.cpp
+  src/acor_kernel.cpp
+)
+target_include_directories(test_ledger_reduction PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(test_ledger_reduction PRIVATE Threads::Threads ZLIB::ZLIB)
+
 if(MSVC)
   target_compile_options(acor_runner PRIVATE /W4 /permissive-)
   target_compile_options(ed_pairs PRIVATE /W4 /permissive-)
@@ -166,6 +173,7 @@ if(BUILD_TESTING)
   )
   set_tests_properties(acor_python_unittest PROPERTIES
     WORKING_DIRECTORY "${ACOR_TEST_PACKAGE_ROOT}")
+  add_test(NAME acor_ledger_reduction COMMAND test_ledger_reduction)
 endif()
 
 message(STATUS "ACOR build profile: ${ACOR_BUILD_PROFILE}")

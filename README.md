@@ -1,14 +1,17 @@
 # ACOR Reconstruction Backbone
 
-ACOR reconstructs a DNA sequence from a cluster of noisy reads. Version 0.1.0
-is the frozen reconstruction backbone in `NO_STOP` mode: every read is consumed
-and no learned early-stop model is included.
+ACOR reconstructs a DNA sequence from a cluster of noisy reads. Version 0.2.0
+keeps the `NO_STOP` reconstruction semantics of v0.1.0 while adding an
+adaptive persistent worker pool and a sparse high-k evidence ledger. Every
+read is consumed and no learned early-stop model is included.
 
 ## Scope
 
 - Release mode: `NO_STOP`
 - Execution model: `CAUSAL_OFFLINE_STREAM_REPLAY`
-- Frozen configuration: `kmc_k9_b16_lognormal`
+- Default configuration: `kmc_k9_b16_lognormal`
+- Supported k-mer sizes: `5` through `15`
+- Execution backend: persistent NUMA-aware adaptive worker pool
 - License: MIT
 - Author: Jarvis5272
 
@@ -56,7 +59,8 @@ cmake --install build --prefix .
 The tests include deterministic order golden files, CLI modes, random-seed
 replay by regenerating the order, thread argument propagation, truth and hidden
 column isolation, failure cleanup, evaluator boundaries, and comparator
-strict-weak-order/frontier identity.
+strict-weak-order/frontier identity. A C++ regression additionally verifies
+that independently accumulated evidence ledgers merge to the serial result.
 
 ## Run
 
@@ -65,6 +69,7 @@ python3 acor.py run \
   --data /path/to/dataset_directory \
   [--aim | --no-aim] \
   [--length N] \
+  [--k 5..15] \
   [--threads 1,4,16,20,32] \
   [--seeds seed1,seed2 | --rounds 3] \
   --results /path/to/results
@@ -85,6 +90,12 @@ The terminal `time` value is `reconstruction_engine_wall`. Round and session
 wall times remain in summaries/manifests. Because early stopping is absent,
 saving/trigger fields are omitted or `NOT_APPLICABLE`.
 
+The default `--k 9` is backward-compatible with v0.1.0. For `k>=12`, ACOR
+automatically stores only observed graph counters instead of allocating the
+full direct-indexed counter space. The selected k-mer size, effective
+configuration, and execution backend are recorded in `RUN_MANIFEST.json` and
+each engine `COMMAND.json`.
+
 ## Data
 
 No research dataset is included in this repository. See
@@ -98,6 +109,7 @@ test-only examples.
 - [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md)
 - [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md)
 - [`docs/REAL10_REGRESSION.md`](docs/REAL10_REGRESSION.md)
+- [`docs/PERFORMANCE_V0.2.md`](docs/PERFORMANCE_V0.2.md)
 
 The evaluator is byte- and case-sensitive. It does not canonicalize sequences.
 The algorithm canonicalization rules apply only inside reconstruction and are

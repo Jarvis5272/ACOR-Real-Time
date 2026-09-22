@@ -6,12 +6,15 @@ README.md
 THIRD_PARTY_NOTICES.md
 VERSION
 acor.py
+benchmarks/v0.2/high_k_sparse_matrix.tsv
+benchmarks/v0.2/v010_v020_a800.tsv
 bin/acor_runner
 bin/ed_pairs
 docs/ALGORITHM.md
 docs/INPUT_FORMAT.md
 docs/LIMITATIONS.md
 docs/OUTPUT_FORMAT.md
+docs/PERFORMANCE_V0.2.md
 docs/REAL10_REGRESSION.md
 docs/REPRODUCIBILITY.md
 provenance/ALGORITHM_LOCK.json

@@ -14,7 +14,7 @@ concurrency:
 
 env:
   ACOR_CI_SEED: 0123456789abcdef0123456789abcdef
-  ACOR_VERSION: 0.1.0
+  ACOR_VERSION: 0.2.0
 
 jobs:
   build-test:
@@ -160,7 +160,7 @@ jobs:
           set -Eeuo pipefail
           source_tar="release/acor-reconstruction-backbone-${ACOR_VERSION}-source.tar.gz"
           binary_tar="release/acor-reconstruction-backbone-${ACOR_VERSION}-linux-x86_64.tar.gz"
-          sha256sum --check release/SHA256SUMS.txt
+          (cd release && sha256sum --check SHA256SUMS.txt)
           python3 -I scripts/verify_release.py --root "${GITHUB_WORKSPACE}" \
             --source-tar "${source_tar}" --binary-tar "${binary_tar}"
 

@@ -24,18 +24,18 @@ import uuid
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
 RUNNER = ROOT / "bin" / "acor_runner"
 ED_EVALUATOR = ROOT / "bin" / "ed_pairs"
-CONFIG = "kmc_k9_b16_lognormal"
-MODE = "NO_STOP"
-KMER_SIZE = 9
+DEFAULT_KMER_SIZE = 9
+ALGORITHM_MODE = "NO_STOP"
+ENGINE_MODE = "LEDGER_ADAPTIVE_POOL"
 MAX_DESIGN_LENGTH = 1_000_000
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 READS_HEADER = [
     "dataset_id", "cluster_id", "read_id", "read_sequence",
     "original_read_sequence", "read_quality", "design_length",
@@ -236,10 +236,13 @@ def inspect_reads(
     source: Path,
     length_override: int | None,
     effective_path: Path | None,
+    minimum_design_length: int = DEFAULT_KMER_SIZE,
 ) -> tuple[str, list[tuple[str, int]], Path, int, dict[str, object]]:
-    if length_override is not None and not (KMER_SIZE <= length_override <= MAX_DESIGN_LENGTH):
+    if length_override is not None and not (
+        minimum_design_length <= length_override <= MAX_DESIGN_LENGTH
+    ):
         raise ValueError(
-            f"--length must be between {KMER_SIZE} and {MAX_DESIGN_LENGTH}"
+            f"--length must be between {minimum_design_length} and {MAX_DESIGN_LENGTH}"
         )
     cluster_sizes: list[tuple[str, int]] = []
     lengths: Counter[int] = Counter()
@@ -293,7 +296,7 @@ def inspect_reads(
                     raise ValueError(
                         f"invalid design_length at row {source_row}"
                     ) from error
-                if not (KMER_SIZE <= design_length <= MAX_DESIGN_LENGTH):
+                if not (minimum_design_length <= design_length <= MAX_DESIGN_LENGTH):
                     raise ValueError(
                         f"design_length out of safe range at row {source_row}: {design_length}"
                     )
@@ -400,11 +403,35 @@ def write_order(
     os.replace(temporary, path)
 
 
+def _physical_core_key(cpu: int) -> tuple[int, int]:
+    topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
+    try:
+        package = int((topology / "physical_package_id").read_text().strip())
+        core = int((topology / "core_id").read_text().strip())
+        return package, core
+    except (OSError, ValueError):
+        return 0, cpu
+
+
 def select_cpus(workers: int) -> tuple[list[int], int]:
     available = sorted(os.sched_getaffinity(0))
     if len(available) < workers + 1:
         raise ValueError(f"threads={workers} needs {workers + 1} available CPUs")
-    return available[:workers], available[workers]
+    physical: list[int] = []
+    observed_cores: set[tuple[int, int]] = set()
+    for cpu in available:
+        key = _physical_core_key(cpu)
+        if key not in observed_cores:
+            observed_cores.add(key)
+            physical.append(cpu)
+    if len(physical) < workers:
+        raise ValueError(
+            f"threads={workers} needs {workers} distinct physical cores; "
+            f"only {len(physical)} are available"
+        )
+    worker_cpus = physical[:workers]
+    control_cpu = next(cpu for cpu in available if cpu not in set(worker_cpus))
+    return worker_cpus, control_cpu
 
 
 def terminate_process_group(process: subprocess.Popen, grace_seconds: float = 5.0) -> int:
@@ -471,21 +498,24 @@ def run_engine(
     dataset: str,
     workers: int,
     on_pulse: Callable[[int], None],
+    config: str = "kmc_k9_b16_lognormal",
+    engine_mode: str = ENGINE_MODE,
 ) -> float:
     engine_dir.mkdir(parents=True, exist_ok=True)
     worker_cpus, control_cpu = select_cpus(workers)
     command = [
         str(RUNNER), str(reads), str(order), str(engine_dir), "ACOR_MINIMAL",
         dataset, dataset, str(workers), ",".join(map(str, worker_cpus)),
-        str(control_cpu), CONFIG, MODE, "0.0", "0.0", "NO_PROFILE",
+        str(control_cpu), config, engine_mode, "0.0", "0.0", "NO_PROFILE",
     ]
     atomic_json(engine_dir / "COMMAND.json", {
         "argv": command,
         "workers": workers,
         "worker_cpus": worker_cpus,
         "control_cpu": control_cpu,
-        "config": CONFIG,
-        "mode": MODE,
+        "config": config,
+        "algorithm_mode": ALGORITHM_MODE,
+        "engine_mode": engine_mode,
     })
     stdout_path = engine_dir / "runner.stdout.log"
     stderr_path = engine_dir / "runner.stderr.log"
@@ -500,6 +530,7 @@ def run_engine(
             start_new_session=True,
             env={
                 **os.environ,
+                "ACOR_CONFIG": config,
                 "OMP_NUM_THREADS": "1",
                 "OPENBLAS_NUM_THREADS": "1",
                 "MKL_NUM_THREADS": "1",
@@ -774,6 +805,7 @@ def run(args: argparse.Namespace) -> int:
     if rounds < 1:
         raise ValueError("--rounds must be at least 1")
     thread_counts = parse_threads(args.threads)
+    config = f"kmc_k{args.k}_b16_lognormal"
 
     result_root = args.results.resolve()
     result_root.mkdir(parents=True, exist_ok=True)
@@ -791,20 +823,22 @@ def run(args: argparse.Namespace) -> int:
     status: dict[str, object] = {
         "session_id": session_id,
         "state": "RUNNING",
-        "created_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         "result_dir": final_session_root.name,
     }
     atomic_json(status_path, status)
     manifest: dict[str, object] = {
         "version": VERSION,
-        "release_mode": MODE,
+        "release_mode": ALGORITHM_MODE,
         "execution_model": "CAUSAL_OFFLINE_STREAM_REPLAY",
+        "execution_backend": ENGINE_MODE,
         "argv": sys.argv,
         "dataset_argument": data.name,
         "seed_source": "EXPLICIT_SEEDS" if seeds is not None else "OS_RANDOM",
         "threads": thread_counts,
-        "config": CONFIG,
-        "mode": MODE,
+        "config": config,
+        "k": args.k,
+        "mode": ALGORITHM_MODE,
         "state": "RUNNING",
         "jobs": [],
         "environment": {
@@ -821,7 +855,7 @@ def run(args: argparse.Namespace) -> int:
         manifest["evaluator"] = preflight_binary(ED_EVALUATOR, "evaluator")
         effective_path = session_root / ".input" / "reads.tsv" if args.length is not None else None
         dataset, cluster_sizes, effective_reads, inferred_length, input_audit = inspect_reads(
-            reads, args.length, effective_path,
+            reads, args.length, effective_path, args.k,
         )
         chosen_length = args.length if args.length is not None else inferred_length
         run_labels = labels(seeds, rounds)
@@ -921,6 +955,8 @@ def run(args: argparse.Namespace) -> int:
                     dataset,
                     workers,
                     lambda frame: dashboard.pulse(workers, engine_status, frame),
+                    config,
+                    ENGINE_MODE,
                 )
                 verify_file_identity(reads, input_audit["source_identity"])
                 verify_file_identity(effective_reads, input_audit["runner_identity"])
@@ -1028,7 +1064,7 @@ def run(args: argparse.Namespace) -> int:
         status.update({
             "state": "COMPLETE",
             "completed_jobs": len(rows),
-            "completed_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "completed_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "summary": "SUMMARY.tsv",
         })
         manifest.update({
@@ -1051,7 +1087,7 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         status.update({
             "state": "INTERRUPTED",
-            "interrupted_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "interrupted_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
         })
         manifest.update({
             "state": "INTERRUPTED",
@@ -1065,7 +1101,7 @@ def run(args: argparse.Namespace) -> int:
     except BaseException as error:
         status.update({
             "state": "FAILED",
-            "failed_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "failed_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
             "error": f"{type(error).__name__}: {error}",
         })
         manifest.update({
@@ -1104,6 +1140,10 @@ def main() -> int:
     mode.add_argument("--aim", action="store_true")
     mode.add_argument("--no-aim", action="store_true")
     runner.add_argument("--length", type=int)
+    runner.add_argument(
+        "--k", type=int, choices=range(5, 16), default=DEFAULT_KMER_SIZE,
+        help="k-mer size (5--15; default: 9)",
+    )
     runner.add_argument("--threads", default="1")
     runner.add_argument("--seeds")
     runner.add_argument("--rounds", type=int)

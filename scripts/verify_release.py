@@ -36,7 +36,7 @@ from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Mapping, Sequence, Set, Tuple
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 TOP = f"acor-reconstruction-backbone-{VERSION}"
 RELEASE_MTIME = 1_704_067_200
 SOURCE_MANIFEST = "scripts/release_source_members.txt"
@@ -53,10 +53,13 @@ REQUIRED_SOURCE: Set[str] = {
     "THIRD_PARTY_NOTICES.md",
     "VERSION",
     "acor.py",
+    "benchmarks/v0.2/high_k_sparse_matrix.tsv",
+    "benchmarks/v0.2/v010_v020_a800.tsv",
     "docs/ALGORITHM.md",
     "docs/INPUT_FORMAT.md",
     "docs/LIMITATIONS.md",
     "docs/OUTPUT_FORMAT.md",
+    "docs/PERFORMANCE_V0.2.md",
     "docs/REAL10_REGRESSION.md",
     "docs/REPRODUCIBILITY.md",
     "provenance/ALGORITHM_LOCK.json",
@@ -98,6 +101,7 @@ REQUIRED_SOURCE: Set[str] = {
     "tests/test_cpp_boundaries.py",
     "tests/test_evaluator.py",
     "tests/test_failure_cleanup.py",
+    "tests/test_ledger_reduction.cpp",
     "tests/test_seed_replay.py",
     "tests/test_thread_identity.py",
     "tests/test_truth_isolation.py",
@@ -113,12 +117,15 @@ REQUIRED_BINARY: Set[str] = {
     "THIRD_PARTY_NOTICES.md",
     "VERSION",
     "acor.py",
+    "benchmarks/v0.2/high_k_sparse_matrix.tsv",
+    "benchmarks/v0.2/v010_v020_a800.tsv",
     "bin/acor_runner",
     "bin/ed_pairs",
     "docs/ALGORITHM.md",
     "docs/INPUT_FORMAT.md",
     "docs/LIMITATIONS.md",
     "docs/OUTPUT_FORMAT.md",
+    "docs/PERFORMANCE_V0.2.md",
     "docs/REAL10_REGRESSION.md",
     "docs/REPRODUCIBILITY.md",
     "provenance/ALGORITHM_LOCK.json",
@@ -187,25 +194,28 @@ MAX_EXPANDED_ARCHIVE = MAX_ARCHIVE_TOTAL + 16 * 1024 * 1024
 # provenance.  A package author therefore cannot change an algorithm file and
 # its in-tree ledger together and still pass this release gate.
 APPROVED_ALGORITHM_SHA256: Mapping[str, str] = {
-    "acor.py": "1d26dd80e71c2c01eb7d3d5a264b583cfe6814bcf225983ae7cb11216046adb9",
-    "src/acor_runner.cpp": "1c8b18590f304a89694a29ea1b5c612ea036c5c63b948da8193f1b406ace7994",
-    "src/acor_kernel.cpp": "9c7abc5a849908919f3841837b0a5ef6fe0841aa553e00948d05a0d5a6a3a6d0",
-    "src/acor_kernel.hpp": "0f6e11c90fda275e1fed5130093977817343108bc150769d10d4975afedb07b9",
+    "acor.py": "366d9e80ff625b95e85d929813eb01a49b772ef7783fb752968329ee3ac87e13",
+    "src/acor_runner.cpp": "5daa71f1181395ff2856fcc0d721bccc938e658e3bb609b9faa68c1e030d398e",
+    "src/acor_kernel.cpp": "878d11bb899e4a370394482432400292a56bbc170df9c1282312b48407eae15b",
+    "src/acor_kernel.hpp": "7fc1fbed15f032c8c3526356cb3dddc960976250c68c071709c159493bc785c1",
     "src/ed_pairs.cpp": "a191b6743448a3902f9ad1cd951fab2464ff3ad2f41f1f105f18f0753acf85a1",
 }
 
 EXPECTED_ALGORITHM_LOCK: Mapping[str, object] = {
     "beam_width": 16,
     "canonical": "A/a->A,C/c->C,G/g->G,T/t->T,other->N",
-    "config": "kmc_k9_b16_lognormal",
+    "config": "kmc_k9_b16_lognormal (default)",
     "execution_model": "CAUSAL_OFFLINE_STREAM_REPLAY",
+    "execution_backend": "LEDGER_ADAPTIVE_POOL",
     "final_decode": "FinalOnlyExact",
-    "k": 9,
+    "k_default": 9,
+    "k_supported": [5, 15],
     "length_prior": "lognormal",
     "mode": "NO_STOP",
+    "sparse_ledger_threshold": 12,
     "seed_derivation": "sha256(acor|minimal|seed|dataset|cluster_id)[:16]",
     "support_bonus": 0.15,
-    "version": "0.1.0",
+    "version": "0.2.0",
 }
 
 EXPECTED_FROZEN_REFERENCE: Mapping[str, object] = {
@@ -244,12 +254,12 @@ SOFTWARE.
 EXPECTED_CITATION = """cff-version: 1.2.0
 message: "If you use ACOR Reconstruction Backbone, please cite this software."
 title: "ACOR Reconstruction Backbone"
-version: 0.1.0
-date-released: 2026-08-22
+version: 0.2.0
+date-released: 2026-09-22
 authors:
   - family-names: "Jarvis5272"
 license: MIT
-repository-code: "https://github.com/Jarvis5272/ACOR"
+repository-code: "https://github.com/Jarvis5272/ACOR-Real-Time"
 """.encode("utf-8")
 
 EXPECTED_DATASETS: Set[str] = {
@@ -848,19 +858,19 @@ def verify_semantic_contract(payloads: Mapping[str, bytes]) -> None:
             "component": "python_cli",
             "frozen_source_sha256": "3b1f00eeab20d7b3ea65bab6c3880229f67eee02df554a8077316203c3de9c17",
             "release_source": "acor.py",
-            "relation": "behavior-preserving engineering hardening",
+            "relation": "v0.1-compatible defaults plus public k selection and backend audit",
         },
         {
             "component": "runner",
             "frozen_source_sha256": "9acc4dc286859fa786202935c7d5affe53092e132af03dc70e53f1b9a055b04e",
             "release_source": "src/acor_runner.cpp",
-            "relation": "frozen algorithm plus metadata and boundary hardening",
+            "relation": "v0.1 algorithm plus persistent adaptive NUMA-aware scheduling",
         },
         {
             "component": "kernel",
             "frozen_source_sha256": "debde33a5cab10fdde4ec63eb16d4bbe8399ca65ea5f2fce9b7003968eb2384e",
             "release_source": "src/acor_kernel.cpp",
-            "relation": "frozen algorithm plus boundary hardening and runtime interface separation",
+            "relation": "v0.1 algorithm plus exact sparse high-k evidence storage and merge",
         },
         {
             "component": "evaluator",

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly RELEASE_VERSION="0.1.0"
+readonly RELEASE_VERSION="0.2.0"
 readonly RELEASE_TOP="acor-reconstruction-backbone-${RELEASE_VERSION}"
 readonly RELEASE_MTIME="1704067200"
 readonly SMOKE_SEED="0123456789abcdef0123456789abcdef"

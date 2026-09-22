@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -161,10 +162,17 @@ static char code_base(int code) {
     return BASES[code & 3];
 }
 
+static void canonical_into(const std::string& sequence, std::string& output) {
+    output.resize(sequence.size());
+    for (size_t index = 0; index < sequence.size(); ++index) {
+        output[index] = canonical_base(sequence[index]);
+    }
+}
+
 static std::string canonical(const std::string& sequence) {
     std::string result;
     result.reserve(sequence.size());
-    for (char ch : sequence) result.push_back(canonical_base(ch));
+    canonical_into(sequence, result);
     return result;
 }
 
@@ -425,20 +433,12 @@ static Config parse_config(const std::string& name) {
     config.k = parse_component(prefix.size(), beam_marker, "k");
     config.beam_width = parse_component(beam_marker + 2, prior_marker, "beam width");
     config.length_prior = name.substr(prior_marker + 1);
-    if ((config.k != 5 && config.k != 7 && config.k != 9) ||
+    if ((config.k < 5 || config.k > 15) ||
         (config.beam_width != 4 && config.beam_width != 8 && config.beam_width != 16) ||
         (config.length_prior != "median_band" && config.length_prior != "lognormal")) {
         throw std::runtime_error("unsupported config: " + name);
     }
     return config;
-}
-
-static double median(std::vector<int> values) {
-    if (values.empty()) return 0.0;
-    std::sort(values.begin(), values.end());
-    const size_t n = values.size();
-    if (n % 2) return static_cast<double>(values[n / 2]);
-    return 0.5 * static_cast<double>(values[n / 2 - 1] + values[n / 2]);
 }
 
 static int compare_finite_scores_descending(double lhs, double rhs) {
@@ -497,21 +497,143 @@ static std::string materialize_path(
     return sequence;
 }
 
+// Research-only auto-hybrid evidence counter.  Low-k configurations retain
+// the production dense array.  High-k configurations store only observed
+// integer-coded contexts/edges, avoiding the Theta(4^k) allocation while
+// preserving touched-key insertion order and all deterministic tie-breaks.
 class DenseCounter {
 public:
     explicit DenseCounter(size_t size = 0) : values_(size, 0U) {}
 
-    void resize(size_t size) {
-        values_.assign(size, 0U);
+    void resize(size_t size, bool sparse_mode = false) {
+        sparse_mode_ = sparse_mode;
+        logical_size_ = size;
+        values_.assign(sparse_mode_ ? 0U : size, 0U);
+        sparse_values_.clear();
         touched_.clear();
+        atomic_values_.reset();
+        atomic_enabled_ = false;
+        hot_cache_enabled_ = false;
+        hot_keys_.clear();
+        hot_values_.clear();
     }
 
     void clear() {
-        for (uint32_t index : touched_) values_[index] = 0U;
+        if (sparse_mode_) {
+            sparse_values_.clear();
+        } else {
+            for (uint32_t index : touched_) values_[index] = 0U;
+        }
         touched_.clear();
+        if (atomic_enabled_) {
+            if (sparse_mode_) {
+                throw std::runtime_error("atomic updates are unavailable for sparse ledgers");
+            }
+            for (size_t index = 0; index < values_.size(); ++index) {
+                atomic_values_[index].store(0U, std::memory_order_relaxed);
+            }
+        }
+        if (hot_cache_enabled_) {
+            std::fill(hot_keys_.begin(), hot_keys_.end(), kEmptyKey);
+            std::fill(hot_values_.begin(), hot_values_.end(), 0U);
+        }
+    }
+
+    // Optional exact hot-counter cache used by the parallel diagnostic path.
+    // It only delays writes to the dense array; counters remain uint32 and are
+    // flushed exactly before any merge or decode operation.
+    void enable_hot_cache(size_t slots = 4096U) {
+        if (slots < 64U) slots = 64U;
+        size_t capacity = 1U;
+        while (capacity < slots) capacity <<= 1U;
+        hot_keys_.assign(capacity, kEmptyKey);
+        hot_values_.assign(capacity, 0U);
+        hot_cache_enabled_ = true;
+    }
+
+    void enable_atomic_updates() {
+        if (sparse_mode_) {
+            throw std::runtime_error("atomic updates are unavailable for sparse ledgers");
+        }
+        if (hot_cache_enabled_) {
+            throw std::runtime_error("dense counter cannot combine atomic and hot-cache modes");
+        }
+        atomic_values_ = std::make_unique<std::atomic<uint32_t>[]>(values_.size());
+        for (size_t index = 0; index < values_.size(); ++index) {
+            atomic_values_[index].store(values_[index], std::memory_order_relaxed);
+        }
+        atomic_enabled_ = true;
+    }
+
+    void flush_atomic_updates() {
+        if (!atomic_enabled_) return;
+        touched_.clear();
+        touched_.reserve(values_.size());
+        for (uint32_t index = 0; index < values_.size(); ++index) {
+            const uint32_t value = atomic_values_[index].load(std::memory_order_relaxed);
+            values_[index] = value;
+            if (value != 0U) touched_.push_back(index);
+        }
+    }
+
+    void flush_hot_cache() {
+        if (!hot_cache_enabled_) return;
+        for (size_t slot = 0; slot < hot_keys_.size(); ++slot) {
+            const uint32_t index = hot_keys_[slot];
+            if (index == kEmptyKey) continue;
+            const uint32_t amount = hot_values_[slot];
+            if (amount == 0U) continue;
+            add_amount(index, amount, "counter hot-cache overflow");
+            hot_keys_[slot] = kEmptyKey;
+            hot_values_[slot] = 0U;
+        }
     }
 
     void increment(uint32_t index) {
+        if (atomic_enabled_) {
+            uint32_t old = atomic_values_[index].load(std::memory_order_relaxed);
+            while (true) {
+                if (old == std::numeric_limits<uint32_t>::max()) {
+                    throw std::runtime_error("atomic dense counter overflow");
+                }
+                if (atomic_values_[index].compare_exchange_weak(
+                        old, old + 1U, std::memory_order_relaxed,
+                        std::memory_order_relaxed)) {
+                    return;
+                }
+            }
+        }
+        if (hot_cache_enabled_) {
+            const size_t slot = (static_cast<uint64_t>(index) * 2654435761ULL) &
+                                (hot_keys_.size() - 1U);
+            if (hot_keys_[slot] == index) {
+                if (hot_values_[slot] == std::numeric_limits<uint32_t>::max()) {
+                    throw std::runtime_error("dense counter hot-cache overflow");
+                }
+                ++hot_values_[slot];
+                return;
+            }
+            if (hot_keys_[slot] != kEmptyKey) {
+                const uint32_t old_index = hot_keys_[slot];
+                const uint32_t amount = hot_values_[slot];
+                add_amount(old_index, amount, "counter hot-cache overflow");
+            }
+            hot_keys_[slot] = index;
+            hot_values_[slot] = 1U;
+            return;
+        }
+        add_amount(index, 1U, "counter overflow");
+    }
+
+    // The ordinary reconstruction path never enables atomic updates or the
+    // hot-counter cache.  Keep that hot loop free of two predictable but
+    // still per-k-mer mode branches; specialized paths continue to use
+    // increment() above.
+    inline void increment_plain(uint32_t index) {
+        if (sparse_mode_) {
+            add_amount(index, 1U, "sparse counter overflow");
+            return;
+        }
         if (values_[index] == 0U) touched_.push_back(index);
         if (values_[index] == std::numeric_limits<uint32_t>::max()) {
             throw std::runtime_error("dense counter overflow");
@@ -519,14 +641,141 @@ public:
         ++values_[index];
     }
 
-    uint32_t get(uint32_t index) const { return values_[index]; }
+    void add_from(const DenseCounter& other) {
+        if (sparse_mode_ != other.sparse_mode_ || logical_size_ != other.logical_size_) {
+            throw std::runtime_error("incompatible counter representations");
+        }
+        for (uint32_t index : other.touched_) {
+            const uint32_t amount = other.get(index);
+            if (amount == 0U) continue;
+            add_amount(index, amount, "counter merge overflow");
+        }
+    }
+
+    // Owner-sharded reduction writes disjoint counter indices from multiple
+    // threads.  Do not mutate touched_ here: each owner thread keeps the
+    // values update-only, and touched_ is rebuilt once after all owners join.
+    void add_sharded(uint32_t index, uint32_t amount) {
+        if (index >= logical_size_) throw std::runtime_error("counter index outside range");
+        if (sparse_mode_) {
+            throw std::runtime_error(
+                "shared owner-sharded writes are unavailable for sparse ledgers");
+        }
+        if (amount > std::numeric_limits<uint32_t>::max() - values_[index]) {
+            throw std::runtime_error("dense counter sharded merge overflow");
+        }
+        values_[index] += amount;
+    }
+
+    void add_tile_from(uint32_t begin, const uint32_t* counts, size_t count) {
+        if (begin > logical_size_ || count > logical_size_ - begin) {
+            throw std::runtime_error("counter tile outside range");
+        }
+        if (sparse_mode_) {
+            throw std::runtime_error(
+                "shared owner-tile writes are unavailable for sparse ledgers");
+        }
+        for (size_t offset = 0; offset < count; ++offset) {
+            const uint32_t amount = counts[offset];
+            if (amount == 0U) continue;
+            const size_t index = begin + offset;
+            if (amount > std::numeric_limits<uint32_t>::max() - values_[index]) {
+                throw std::runtime_error("dense counter tile merge overflow");
+            }
+            values_[index] += amount;
+        }
+    }
+
+    void add_dense_range_from(const DenseCounter& other, size_t begin, size_t end) {
+        if (end > logical_size_ || end > other.logical_size_ || begin > end ||
+            sparse_mode_ != other.sparse_mode_) {
+            throw std::runtime_error("counter range outside bounds");
+        }
+        if (sparse_mode_) {
+            add_sparse_range_from(other, begin, end);
+            return;
+        }
+        for (size_t index = begin; index < end; ++index) {
+            const uint32_t amount = other.values_[index];
+            if (amount > std::numeric_limits<uint32_t>::max() - values_[index]) {
+                throw std::runtime_error("dense counter range merge overflow");
+            }
+            values_[index] += amount;
+        }
+    }
+
+    void add_sparse_range_from(const DenseCounter& other, size_t begin, size_t end) {
+        if (end > logical_size_ || end > other.logical_size_ || begin > end ||
+            sparse_mode_ != other.sparse_mode_) {
+            throw std::runtime_error("counter sparse range outside bounds");
+        }
+        if (sparse_mode_) {
+            throw std::runtime_error(
+                "shared range writes are unavailable for sparse ledgers");
+        }
+        for (uint32_t index : other.touched_) {
+            if (index < begin || index >= end) continue;
+            const uint32_t amount = other.get(index);
+            if (amount > std::numeric_limits<uint32_t>::max() - values_[index]) {
+                throw std::runtime_error("dense counter sparse range merge overflow");
+            }
+            values_[index] += amount;
+        }
+    }
+
+    void rebuild_touched() {
+        flush_atomic_updates();
+        flush_hot_cache();
+        if (!sparse_mode_) {
+            touched_.clear();
+            touched_.reserve(values_.size());
+            for (uint32_t index = 0; index < values_.size(); ++index) {
+                if (values_[index] != 0U) touched_.push_back(index);
+            }
+        }
+    }
+
+    uint32_t get(uint32_t index) const {
+        if (!sparse_mode_) return values_[index];
+        const auto found = sparse_values_.find(index);
+        return found == sparse_values_.end() ? 0U : found->second;
+    }
+    size_t values_size() const { return logical_size_; }
+    bool sparse_mode() const { return sparse_mode_; }
     bool empty() const { return touched_.empty(); }
     size_t size() const { return touched_.size(); }
     const std::vector<uint32_t>& touched() const { return touched_; }
 
 private:
+    void add_amount(uint32_t index, uint32_t amount, const char* overflow_message) {
+        if (index >= logical_size_) throw std::runtime_error("counter index outside range");
+        if (!sparse_mode_) {
+            if (amount > std::numeric_limits<uint32_t>::max() - values_[index]) {
+                throw std::runtime_error(overflow_message);
+            }
+            if (amount != 0U && values_[index] == 0U) touched_.push_back(index);
+            values_[index] += amount;
+            return;
+        }
+        auto inserted = sparse_values_.emplace(index, 0U);
+        if (amount > std::numeric_limits<uint32_t>::max() - inserted.first->second) {
+            throw std::runtime_error(overflow_message);
+        }
+        if (amount != 0U && inserted.second) touched_.push_back(index);
+        inserted.first->second += amount;
+    }
+
+    static constexpr uint32_t kEmptyKey = std::numeric_limits<uint32_t>::max();
+    bool sparse_mode_ = false;
+    size_t logical_size_ = 0U;
     std::vector<uint32_t> values_;
+    std::unordered_map<uint32_t, uint32_t> sparse_values_;
     std::vector<uint32_t> touched_;
+    bool atomic_enabled_ = false;
+    std::unique_ptr<std::atomic<uint32_t>[]> atomic_values_;
+    bool hot_cache_enabled_ = false;
+    std::vector<uint32_t> hot_keys_;
+    std::vector<uint32_t> hot_values_;
 };
 
 class IncrementalKmcBeam {
@@ -545,15 +794,18 @@ public:
         }
         mask_ = (static_cast<uint32_t>(1) << (2 * config_.k)) - 1U;
         const size_t node_slots = static_cast<size_t>(1U) << (2 * config_.k);
-        node_counts_.resize(node_slots);
-        outgoing_totals_.resize(node_slots);
-        start_counts_.resize(node_slots);
-        end_counts_.resize(node_slots);
-        edge_counts_.resize(node_slots * 4U);
-        transition_score_cache_.assign(
-            node_slots * 4U, -std::numeric_limits<double>::infinity());
-        transition_score_cache_epoch_.assign(node_slots, 0U);
-        dirty_context_epoch_.assign(node_slots, 0U);
+        sparse_ledger_ = config_.k >= 12;
+        node_counts_.resize(node_slots, sparse_ledger_);
+        outgoing_totals_.resize(node_slots, sparse_ledger_);
+        start_counts_.resize(node_slots, sparse_ledger_);
+        end_counts_.resize(node_slots, sparse_ledger_);
+        edge_counts_.resize(node_slots * 4U, sparse_ledger_);
+        if (!sparse_ledger_) {
+            transition_score_cache_.assign(
+                node_slots * 4U, -std::numeric_limits<double>::infinity());
+            transition_score_cache_epoch_.assign(node_slots, 0U);
+            dirty_context_epoch_.assign(node_slots, 0U);
+        }
     }
 
     void reset(int design_length) {
@@ -566,6 +818,8 @@ public:
         start_counts_.clear();
         end_counts_.clear();
         read_counts_.clear();
+        length_samples_.clear();
+        deferred_length_prior_ = false;
         lower_lengths_ = {};
         upper_lengths_ = {};
         log_length_sum_ = 0.0;
@@ -583,6 +837,12 @@ public:
         path_cache_hits_ = 0;
         sparse_pool_.clear();
         dirty_contexts_.clear();
+        if (sparse_ledger_) {
+            dirty_context_epoch_sparse_.clear();
+            transition_score_cache_sparse_.clear();
+            transition_score_cache_epoch_sparse_.clear();
+            current_update_epoch_ = 0U;
+        }
         sparse_candidates_refreshed_total_ = 0;
         sparse_dependencies_updated_total_ = 0;
         sparse_repairs_generated_total_ = 0;
@@ -590,27 +850,17 @@ public:
     }
 
     ConsensusResult add_read(const std::string& sequence, bool is_last) {
-        if (sequence.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
-            throw std::runtime_error("read length exceeds integer range");
-        }
-        if (reads_arrived_ == std::numeric_limits<size_t>::max()) {
-            throw std::runtime_error("read arrival counter overflow");
-        }
-        ++reads_arrived_;
-        add_length(static_cast<int>(sequence.size()));
-        const double log_length = std::log(static_cast<double>(std::max<size_t>(1, sequence.size())));
-        log_length_sum_ += log_length;
-        log_length_sq_sum_ += log_length * log_length;
-        uint32_t& sequence_count = read_counts_[sequence];
-        if (sequence_count == std::numeric_limits<uint32_t>::max()) {
-            throw std::runtime_error("read multiplicity overflow");
-        }
-        ++sequence_count;
-        if (static_cast<int>(sequence.size()) == design_length_) ++exact_m_read_count_;
-        const auto graph_started = std::chrono::steady_clock::now();
-        update_graph(sequence);
-        graph_update_seconds_ += std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - graph_started).count();
+        // Final-only hot-cache workers never decode an intermediate prefix,
+        // so maintaining the incremental dirty-context frontier would only
+        // add per-k-mer writes and, more importantly, would route updates
+        // around the hot counter cache.  Ordinary execution keeps the
+        // historical dirty-tracking path unchanged.
+        accumulate_evidence(sequence, false, hot_cache_active_);
+        // Hot-cache mode defers dense-counter writes.  Flush only at the
+        // final read, immediately before the deterministic decode, so the
+        // adaptive-pool experiment observes exactly the same evidence state
+        // as the ordinary path without paying a flush on every read.
+        if (is_last) flush_pending_hot_cache();
         if (optimization_mode_ == OptimizationMode::FinalOnlyExact && !is_last) {
             ConsensusResult deferred;
             deferred.median_read_length = current_median();
@@ -640,8 +890,375 @@ public:
         return result;
     }
 
+    // Experimental parallel-reduction API.  These methods deliberately keep
+    // decoding out of local workers: workers accumulate only additive
+    // evidence, after which one merged model performs the deterministic
+    // final decode.
+    void add_read_evidence_only(const std::string& sequence) {
+        // The evidence-only path does not need an online median after every
+        // read. Keep exact length samples and build the two heaps once before
+        // the deterministic final decode.
+        deferred_length_prior_ = true;
+        accumulate_evidence(sequence, true, true);
+    }
+
+    // Shared-ledger diagnostic path.  Only the five additive graph counters
+    // are touched here; metadata is accumulated independently by each worker
+    // and merged after all atomic updates finish.
+    void add_read_graph_atomic(const std::string& sequence) {
+        uint32_t code = 0U;
+        uint32_t previous_kmer = 0U;
+        int valid_run = 0;
+        bool have_previous = false;
+        for (char ch : sequence) {
+            const int base = base_code(ch);
+            if (base < 0) {
+                code = 0U;
+                valid_run = 0;
+                have_previous = false;
+                continue;
+            }
+            code = ((code << 2U) | static_cast<uint32_t>(base)) & mask_;
+            ++valid_run;
+            if (valid_run < config_.k) continue;
+            node_counts_.increment(code);
+            if (have_previous) {
+                edge_counts_.increment((previous_kmer << 2U) | static_cast<uint32_t>(base));
+                outgoing_totals_.increment(previous_kmer);
+            }
+            previous_kmer = code;
+            have_previous = true;
+        }
+        // start/end counters are additive graph evidence as well.  We need a
+        // second pass only to preserve the exact first/last k-mer semantics.
+        code = 0U;
+        valid_run = 0;
+        bool have_first = false;
+        uint32_t first_kmer = 0U;
+        uint32_t last_kmer = 0U;
+        for (char ch : sequence) {
+            const int base = base_code(ch);
+            if (base < 0) {
+                code = 0U;
+                valid_run = 0;
+                continue;
+            }
+            code = ((code << 2U) | static_cast<uint32_t>(base)) & mask_;
+            ++valid_run;
+            if (valid_run < config_.k) continue;
+            if (!have_first) {
+                first_kmer = code;
+                have_first = true;
+            }
+            last_kmer = code;
+        }
+        if (have_first) {
+            start_counts_.increment(first_kmer);
+            end_counts_.increment(last_kmer);
+        }
+    }
+
+    void enable_hot_cache() {
+        node_counts_.enable_hot_cache();
+        edge_counts_.enable_hot_cache();
+        outgoing_totals_.enable_hot_cache();
+        start_counts_.enable_hot_cache();
+        end_counts_.enable_hot_cache();
+        hot_cache_active_ = true;
+    }
+
+    void enable_atomic_updates() {
+        node_counts_.enable_atomic_updates();
+        edge_counts_.enable_atomic_updates();
+        outgoing_totals_.enable_atomic_updates();
+        start_counts_.enable_atomic_updates();
+        end_counts_.enable_atomic_updates();
+    }
+
+    void flush_atomic_updates() {
+        node_counts_.flush_atomic_updates();
+        edge_counts_.flush_atomic_updates();
+        outgoing_totals_.flush_atomic_updates();
+        start_counts_.flush_atomic_updates();
+        end_counts_.flush_atomic_updates();
+    }
+
+    void flush_pending_hot_cache() {
+        node_counts_.flush_hot_cache();
+        edge_counts_.flush_hot_cache();
+        outgoing_totals_.flush_hot_cache();
+        start_counts_.flush_hot_cache();
+        end_counts_.flush_hot_cache();
+        if (hot_cache_active_) {
+            // The cache path intentionally skips per-read dirty-frontier
+            // maintenance.  Advance the cache generation once and invalidate
+            // every context that actually received outgoing evidence before
+            // the one deterministic final decode.  This is O(observed
+            // contexts), not O(4^k), and preserves the exact score cache
+            // semantics of the ordinary path.
+            begin_dirty_epoch();
+            for (uint32_t context : outgoing_totals_.touched()) {
+                mark_dirty_context(context);
+            }
+        }
+    }
+
+    void append_evidence_deltas(
+        const std::string& sequence, std::vector<AcorCounterDelta>& output) const {
+        if (sequence.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("read length exceeds integer range");
+        }
+        uint32_t code = 0U;
+        uint32_t previous = 0U;
+        uint32_t first = 0U;
+        uint32_t last = 0U;
+        int valid_run = 0;
+        bool have_previous = false;
+        bool have_first = false;
+        for (char ch : sequence) {
+            const int base = base_code(ch);
+            if (base < 0) {
+                code = 0U;
+                valid_run = 0;
+                have_previous = false;
+                continue;
+            }
+            code = ((code << 2U) | static_cast<uint32_t>(base)) & mask_;
+            ++valid_run;
+            if (valid_run < config_.k) continue;
+            output.push_back({0U, code, 1U});
+            if (!have_first) {
+                first = code;
+                have_first = true;
+            }
+            last = code;
+            if (have_previous) {
+                output.push_back({1U,
+                    (previous << 2U) | static_cast<uint32_t>(base), 1U});
+                output.push_back({2U, previous, 1U});
+            }
+            previous = code;
+            have_previous = true;
+        }
+        if (have_first) {
+            output.push_back({3U, first, 1U});
+            output.push_back({4U, last, 1U});
+        }
+    }
+
+    void reserve_evidence(std::size_t read_count) {
+        read_counts_.reserve(read_count);
+        length_samples_.reserve(read_count);
+    }
+
+    void merge_evidence_from(const IncrementalKmcBeam& other) {
+        if (config_.k != other.config_.k || design_length_ != other.design_length_) {
+            throw std::runtime_error("incompatible evidence ledgers");
+        }
+        node_counts_.add_from(other.node_counts_);
+        edge_counts_.add_from(other.edge_counts_);
+        outgoing_totals_.add_from(other.outgoing_totals_);
+        start_counts_.add_from(other.start_counts_);
+        end_counts_.add_from(other.end_counts_);
+        for (const auto& item : other.read_counts_) {
+            uint32_t& target = read_counts_[item.first];
+            if (target > std::numeric_limits<uint32_t>::max() - item.second) {
+                throw std::runtime_error("read multiplicity merge overflow");
+            }
+            target += item.second;
+        }
+        if (deferred_length_prior_ || other.deferred_length_prior_) {
+            deferred_length_prior_ = true;
+            length_samples_.insert(
+                length_samples_.end(), other.length_samples_.begin(), other.length_samples_.end());
+        } else {
+            for (int length : other.length_samples_) {
+                add_length(length);
+                length_samples_.push_back(length);
+            }
+        }
+        if (reads_arrived_ > std::numeric_limits<size_t>::max() - other.reads_arrived_) {
+            throw std::runtime_error("read count merge overflow");
+        }
+        reads_arrived_ += other.reads_arrived_;
+        if (exact_m_read_count_ > std::numeric_limits<size_t>::max() - other.exact_m_read_count_) {
+            throw std::runtime_error("exact-length read count merge overflow");
+        }
+        exact_m_read_count_ += other.exact_m_read_count_;
+        log_length_sum_ += other.log_length_sum_;
+        log_length_sq_sum_ += other.log_length_sq_sum_;
+        total_start_observations_ += other.total_start_observations_;
+        clear_derived_decode_state();
+    }
+
+    void apply_counter_deltas(const std::vector<AcorCounterDelta>& deltas) {
+        for (const AcorCounterDelta& delta : deltas) {
+            switch (delta.kind) {
+            case 0U: node_counts_.add_sharded(delta.index, delta.amount); break;
+            case 1U: edge_counts_.add_sharded(delta.index, delta.amount); break;
+            case 2U: outgoing_totals_.add_sharded(delta.index, delta.amount); break;
+            case 3U: start_counts_.add_sharded(delta.index, delta.amount); break;
+            case 4U: end_counts_.add_sharded(delta.index, delta.amount); break;
+            default: throw std::runtime_error("unknown sparse counter kind");
+            }
+        }
+    }
+
+    void apply_counter_tile(
+        std::uint8_t kind, std::uint32_t begin, const std::uint32_t* counts,
+        std::size_t count) {
+        switch (kind) {
+        case 0U: node_counts_.add_tile_from(begin, counts, count); break;
+        case 1U: edge_counts_.add_tile_from(begin, counts, count); break;
+        case 2U: outgoing_totals_.add_tile_from(begin, counts, count); break;
+        case 3U: start_counts_.add_tile_from(begin, counts, count); break;
+        case 4U: end_counts_.add_tile_from(begin, counts, count); break;
+        default: throw std::runtime_error("unknown counter tile kind");
+        }
+    }
+
+    void finalize_counter_deltas() {
+        node_counts_.rebuild_touched();
+        edge_counts_.rebuild_touched();
+        outgoing_totals_.rebuild_touched();
+        start_counts_.rebuild_touched();
+        end_counts_.rebuild_touched();
+        clear_derived_decode_state();
+    }
+
+    void merge_sparse_metadata(
+        const std::vector<std::pair<std::string, uint32_t>>& read_counts,
+        const std::vector<int>& lengths,
+        size_t reads_arrived,
+        size_t exact_m_read_count,
+        double log_length_sum,
+        double log_length_sq_sum,
+        uint64_t total_start_observations) {
+        deferred_length_prior_ = true;
+        length_samples_.insert(length_samples_.end(), lengths.begin(), lengths.end());
+        for (const auto& item : read_counts) {
+            uint32_t& target = read_counts_[item.first];
+            if (target > std::numeric_limits<uint32_t>::max() - item.second) {
+                throw std::runtime_error("read multiplicity sparse merge overflow");
+            }
+            target += item.second;
+        }
+        if (reads_arrived_ > std::numeric_limits<size_t>::max() - reads_arrived) {
+            throw std::runtime_error("read count sparse merge overflow");
+        }
+        reads_arrived_ += reads_arrived;
+        if (exact_m_read_count_ > std::numeric_limits<size_t>::max() - exact_m_read_count) {
+            throw std::runtime_error("exact-length sparse merge overflow");
+        }
+        exact_m_read_count_ += exact_m_read_count;
+        log_length_sum_ += log_length_sum;
+        log_length_sq_sum_ += log_length_sq_sum;
+        if (total_start_observations_ >
+            std::numeric_limits<uint64_t>::max() - total_start_observations) {
+            throw std::runtime_error("start observation sparse merge overflow");
+        }
+        total_start_observations_ += total_start_observations;
+        clear_derived_decode_state();
+    }
+
+    void merge_counter_range_from(
+        const IncrementalKmcBeam& other, size_t shard, size_t shard_count) {
+        if (config_.k != other.config_.k || design_length_ != other.design_length_) {
+            throw std::runtime_error("incompatible evidence ledgers");
+        }
+        const auto bounds = [shard, shard_count](size_t size) {
+            return std::pair<size_t, size_t>{
+                size * shard / shard_count, size * (shard + 1U) / shard_count};
+        };
+        const auto node_bounds = bounds(node_counts_.values_size());
+        const auto edge_bounds = bounds(edge_counts_.values_size());
+        const auto outgoing_bounds = bounds(outgoing_totals_.values_size());
+        const auto start_bounds = bounds(start_counts_.values_size());
+        const auto end_bounds = bounds(end_counts_.values_size());
+        node_counts_.add_dense_range_from(other.node_counts_, node_bounds.first, node_bounds.second);
+        edge_counts_.add_dense_range_from(other.edge_counts_, edge_bounds.first, edge_bounds.second);
+        outgoing_totals_.add_dense_range_from(
+            other.outgoing_totals_, outgoing_bounds.first, outgoing_bounds.second);
+        start_counts_.add_dense_range_from(other.start_counts_, start_bounds.first, start_bounds.second);
+        end_counts_.add_dense_range_from(other.end_counts_, end_bounds.first, end_bounds.second);
+    }
+
+    void merge_counter_sparse_range_from(
+        const IncrementalKmcBeam& other, size_t shard, size_t shard_count) {
+        if (config_.k != other.config_.k || design_length_ != other.design_length_) {
+            throw std::runtime_error("incompatible evidence ledgers");
+        }
+        const auto bounds = [shard, shard_count](size_t size) {
+            return std::pair<size_t, size_t>{
+                size * shard / shard_count, size * (shard + 1U) / shard_count};
+        };
+        const auto node_bounds = bounds(node_counts_.values_size());
+        const auto edge_bounds = bounds(edge_counts_.values_size());
+        const auto outgoing_bounds = bounds(outgoing_totals_.values_size());
+        const auto start_bounds = bounds(start_counts_.values_size());
+        const auto end_bounds = bounds(end_counts_.values_size());
+        node_counts_.add_sparse_range_from(other.node_counts_, node_bounds.first, node_bounds.second);
+        edge_counts_.add_sparse_range_from(other.edge_counts_, edge_bounds.first, edge_bounds.second);
+        outgoing_totals_.add_sparse_range_from(
+            other.outgoing_totals_, outgoing_bounds.first, outgoing_bounds.second);
+        start_counts_.add_sparse_range_from(other.start_counts_, start_bounds.first, start_bounds.second);
+        end_counts_.add_sparse_range_from(other.end_counts_, end_bounds.first, end_bounds.second);
+    }
+
+    void finalize_counter_range_merge() {
+        node_counts_.rebuild_touched();
+        edge_counts_.rebuild_touched();
+        outgoing_totals_.rebuild_touched();
+        start_counts_.rebuild_touched();
+        end_counts_.rebuild_touched();
+        clear_derived_decode_state();
+    }
+
+    void merge_evidence_metadata_from(const IncrementalKmcBeam& other) {
+        if (config_.k != other.config_.k || design_length_ != other.design_length_) {
+            throw std::runtime_error("incompatible evidence ledgers");
+        }
+        for (const auto& item : other.read_counts_) {
+            uint32_t& target = read_counts_[item.first];
+            if (target > std::numeric_limits<uint32_t>::max() - item.second) {
+                throw std::runtime_error("read multiplicity merge overflow");
+            }
+            target += item.second;
+        }
+        if (deferred_length_prior_ || other.deferred_length_prior_) {
+            deferred_length_prior_ = true;
+            length_samples_.insert(
+                length_samples_.end(), other.length_samples_.begin(), other.length_samples_.end());
+        } else {
+            for (int length : other.length_samples_) {
+                add_length(length);
+                length_samples_.push_back(length);
+            }
+        }
+        if (reads_arrived_ > std::numeric_limits<size_t>::max() - other.reads_arrived_) {
+            throw std::runtime_error("read count merge overflow");
+        }
+        reads_arrived_ += other.reads_arrived_;
+        if (exact_m_read_count_ >
+            std::numeric_limits<size_t>::max() - other.exact_m_read_count_) {
+            throw std::runtime_error("exact-length read count merge overflow");
+        }
+        exact_m_read_count_ += other.exact_m_read_count_;
+        log_length_sum_ += other.log_length_sum_;
+        log_length_sq_sum_ += other.log_length_sq_sum_;
+        total_start_observations_ += other.total_start_observations_;
+        clear_derived_decode_state();
+    }
+
+    ConsensusResult decode_final() {
+        materialize_length_prior();
+        return constraint_mode_ == ConstraintMode::SoftLength
+            ? recompute_soft() : recompute();
+    }
+
     size_t node_count() const { return node_counts_.size(); }
     size_t edge_count() const { return edge_counts_.size(); }
+    bool uses_sparse_ledger() const { return sparse_ledger_; }
     size_t reads_arrived() const { return reads_arrived_; }
     size_t candidate_switches() const { return candidate_switches_; }
     const std::string& current_candidate() const { return previous_candidate_; }
@@ -664,6 +1281,16 @@ public:
 #ifdef ACOR_TESTING
     bool test_epoch_wrap_reset() {
         current_update_epoch_ = std::numeric_limits<uint32_t>::max();
+        if (sparse_ledger_) {
+            dirty_context_epoch_sparse_[0] = 17U;
+            transition_score_cache_epoch_sparse_[0] = 17U;
+            transition_score_cache_sparse_[0][0] = 123.0;
+            begin_dirty_epoch();
+            return current_update_epoch_ == 1U
+                && dirty_context_epoch_sparse_.empty()
+                && transition_score_cache_epoch_sparse_.empty()
+                && transition_score_cache_sparse_.empty();
+        }
         dirty_context_epoch_[0] = 17U;
         transition_score_cache_epoch_[0] = 17U;
         transition_score_cache_[0] = 123.0;
@@ -677,12 +1304,75 @@ public:
 #endif
 
 private:
+    void accumulate_evidence(
+        const std::string& sequence,
+        bool defer_length_prior = false,
+        bool skip_dirty_tracking = false) {
+        if (sequence.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw std::runtime_error("read length exceeds integer range");
+        }
+        if (reads_arrived_ == std::numeric_limits<size_t>::max()) {
+            throw std::runtime_error("read arrival counter overflow");
+        }
+        ++reads_arrived_;
+        if (!defer_length_prior) add_length(static_cast<int>(sequence.size()));
+        length_samples_.push_back(static_cast<int>(sequence.size()));
+        const double log_length = std::log(static_cast<double>(std::max<size_t>(1, sequence.size())));
+        log_length_sum_ += log_length;
+        log_length_sq_sum_ += log_length * log_length;
+        uint32_t& sequence_count = read_counts_[sequence];
+        if (sequence_count == std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("read multiplicity overflow");
+        }
+        ++sequence_count;
+        if (static_cast<int>(sequence.size()) == design_length_) ++exact_m_read_count_;
+        const auto graph_started = std::chrono::steady_clock::now();
+        update_graph(sequence, !skip_dirty_tracking);
+        graph_update_seconds_ += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - graph_started).count();
+    }
+
+    void materialize_length_prior() {
+        if (!deferred_length_prior_) return;
+        while (!lower_lengths_.empty()) lower_lengths_.pop();
+        while (!upper_lengths_.empty()) upper_lengths_.pop();
+        for (int length : length_samples_) add_length(length);
+        deferred_length_prior_ = false;
+    }
+
+    void clear_derived_decode_state() {
+        previous_candidate_.clear();
+        candidate_switches_ = 0;
+        graph_update_seconds_ = 0.0;
+        beam_decode_seconds_ = 0.0;
+        start_paths_.clear();
+        path_arena_.clear();
+        path_nodes_created_ = 0;
+        path_cache_hits_ = 0;
+        sparse_pool_.clear();
+        dirty_contexts_.clear();
+        if (sparse_ledger_) {
+            dirty_context_epoch_sparse_.clear();
+            transition_score_cache_epoch_sparse_.clear();
+            transition_score_cache_sparse_.clear();
+        } else {
+            std::fill(dirty_context_epoch_.begin(), dirty_context_epoch_.end(), 0U);
+            std::fill(transition_score_cache_epoch_.begin(), transition_score_cache_epoch_.end(), 0U);
+            std::fill(transition_score_cache_.begin(), transition_score_cache_.end(),
+                      -std::numeric_limits<double>::infinity());
+        }
+        sparse_candidates_refreshed_total_ = 0;
+        sparse_dependencies_updated_total_ = 0;
+        sparse_repairs_generated_total_ = 0;
+    }
+
     Config config_;
     ConstraintMode constraint_mode_ = ConstraintMode::None;
     OptimizationMode optimization_mode_ = OptimizationMode::Full;
     int band_width_ = 0;
     int design_length_ = 0;
     uint32_t mask_ = 0;
+    bool sparse_ledger_ = false;
     DenseCounter node_counts_;
     DenseCounter edge_counts_;
     DenseCounter outgoing_totals_;
@@ -690,9 +1380,15 @@ private:
     DenseCounter end_counts_;
     mutable std::vector<double> transition_score_cache_;
     mutable std::vector<uint32_t> transition_score_cache_epoch_;
+    mutable std::unordered_map<uint32_t, std::array<double, 4>>
+        transition_score_cache_sparse_;
+    mutable std::unordered_map<uint32_t, uint32_t>
+        transition_score_cache_epoch_sparse_;
     std::unordered_map<std::string, uint32_t> read_counts_;
     std::priority_queue<int> lower_lengths_;
     std::priority_queue<int, std::vector<int>, std::greater<int>> upper_lengths_;
+    std::vector<int> length_samples_;
+    bool deferred_length_prior_ = false;
     double log_length_sum_ = 0.0;
     double log_length_sq_sum_ = 0.0;
     std::string previous_candidate_;
@@ -708,11 +1404,13 @@ private:
     std::vector<SparseCandidateState> sparse_pool_;
     std::vector<uint32_t> dirty_contexts_;
     std::vector<uint32_t> dirty_context_epoch_;
+    std::unordered_map<uint32_t, uint32_t> dirty_context_epoch_sparse_;
     uint32_t current_update_epoch_ = 0;
     uint64_t sparse_candidates_refreshed_total_ = 0;
     uint64_t sparse_dependencies_updated_total_ = 0;
     uint64_t sparse_repairs_generated_total_ = 0;
     uint64_t total_start_observations_ = 0;
+    bool hot_cache_active_ = false;
 
 #ifdef ACOR_FRONTIER_AUDIT
     void audit_frontier_rows(
@@ -801,6 +1499,13 @@ private:
         dirty_contexts_.clear();
         ++current_update_epoch_;
         if (current_update_epoch_ == 0U) {
+            if (sparse_ledger_) {
+                dirty_context_epoch_sparse_.clear();
+                transition_score_cache_epoch_sparse_.clear();
+                transition_score_cache_sparse_.clear();
+                current_update_epoch_ = 1U;
+                return;
+            }
             std::fill(dirty_context_epoch_.begin(), dirty_context_epoch_.end(), 0U);
             std::fill(
                 transition_score_cache_epoch_.begin(), transition_score_cache_epoch_.end(),
@@ -813,6 +1518,14 @@ private:
     }
 
     void mark_dirty_context(uint32_t context) {
+        if (sparse_ledger_) {
+            const auto found = dirty_context_epoch_sparse_.find(context);
+            if (found != dirty_context_epoch_sparse_.end() &&
+                found->second == current_update_epoch_) return;
+            dirty_context_epoch_sparse_[context] = current_update_epoch_;
+            dirty_contexts_.push_back(context);
+            return;
+        }
         if (dirty_context_epoch_[context] == current_update_epoch_) return;
         dirty_context_epoch_[context] = current_update_epoch_;
         dirty_contexts_.push_back(context);
@@ -867,8 +1580,8 @@ private:
         return path;
     }
 
-    void update_graph(const std::string& sequence) {
-        begin_dirty_epoch();
+    void update_graph(const std::string& sequence, bool track_dirty) {
+        if (track_dirty) begin_dirty_epoch();
         uint32_t code = 0;
         int valid_run = 0;
         bool have_first = false;
@@ -887,7 +1600,8 @@ private:
             code = ((code << 2U) | static_cast<uint32_t>(base)) & mask_;
             ++valid_run;
             if (valid_run >= config_.k) {
-                node_counts_.increment(code);
+                if (track_dirty) node_counts_.increment_plain(code);
+                else node_counts_.increment(code);
                 if (!have_first) {
                     first_kmer = code;
                     have_first = true;
@@ -895,23 +1609,35 @@ private:
                 last_kmer = code;
                 if (have_previous) {
                     const uint32_t edge = (previous_kmer << 2U) | static_cast<uint32_t>(base);
-                    edge_counts_.increment(edge);
-                    outgoing_totals_.increment(previous_kmer);
-                    mark_dirty_context(previous_kmer);
+                    if (track_dirty) {
+                        edge_counts_.increment_plain(edge);
+                        outgoing_totals_.increment_plain(previous_kmer);
+                    } else {
+                        edge_counts_.increment(edge);
+                        outgoing_totals_.increment(previous_kmer);
+                    }
+                    if (track_dirty) mark_dirty_context(previous_kmer);
                 }
                 previous_kmer = code;
                 have_previous = true;
             }
         }
         if (have_first) {
-            start_counts_.increment(first_kmer);
-            end_counts_.increment(last_kmer);
+            if (track_dirty) {
+                start_counts_.increment_plain(first_kmer);
+                end_counts_.increment_plain(last_kmer);
+            } else {
+                start_counts_.increment(first_kmer);
+                end_counts_.increment(last_kmer);
+            }
             if (total_start_observations_ == std::numeric_limits<uint64_t>::max()) {
                 throw std::runtime_error("start observation counter overflow");
             }
             ++total_start_observations_;
-            mark_dirty_context(first_kmer);
-            mark_dirty_context(last_kmer);
+            if (track_dirty) {
+                mark_dirty_context(first_kmer);
+                mark_dirty_context(last_kmer);
+            }
         }
     }
 
@@ -1186,6 +1912,32 @@ private:
     }
 
     double transition_score(uint32_t context, int base) const {
+        if (sparse_ledger_) {
+            const auto dirty_found = dirty_context_epoch_sparse_.find(context);
+            const uint32_t dirty_epoch = dirty_found == dirty_context_epoch_sparse_.end()
+                ? 0U : dirty_found->second;
+            const auto cached_found = transition_score_cache_epoch_sparse_.find(context);
+            const uint32_t cached_epoch =
+                cached_found == transition_score_cache_epoch_sparse_.end()
+                    ? std::numeric_limits<uint32_t>::max() : cached_found->second;
+            if (cached_epoch != dirty_epoch) {
+                const uint32_t total = outgoing_totals_.get(context);
+                auto& scores = transition_score_cache_sparse_[context];
+                for (int candidate_base = 0; candidate_base < 4; ++candidate_base) {
+                    const uint32_t candidate_edge =
+                        (context << 2U) | static_cast<uint32_t>(candidate_base);
+                    const uint32_t support = edge_counts_.get(candidate_edge);
+                    scores[static_cast<size_t>(candidate_base)] = support == 0U
+                        ? -std::numeric_limits<double>::infinity()
+                        : std::log(
+                            (static_cast<double>(support) + 1.0) /
+                            (static_cast<double>(total) + 4.0))
+                            + 0.15 * std::log1p(static_cast<double>(support));
+                }
+                transition_score_cache_epoch_sparse_[context] = dirty_epoch;
+            }
+            return transition_score_cache_sparse_.at(context)[static_cast<size_t>(base)];
+        }
         if (transition_score_cache_epoch_[context] != dirty_context_epoch_[context]) {
             const uint32_t total = outgoing_totals_.get(context);
             for (int candidate_base = 0; candidate_base < 4; ++candidate_base) {
@@ -1537,8 +2289,17 @@ private:
     }
 };
 
+static Config research_default_config() {
+    const char* override_name = std::getenv("ACOR_CONFIG");
+    if (override_name == nullptr) {
+        override_name = std::getenv("ACOR_RESEARCH_CONFIG");
+    }
+    return parse_config(override_name == nullptr
+        ? "kmc_k9_b16_lognormal" : std::string(override_name));
+}
+
 struct AcorKernel::Impl {
-    Config config = parse_config("kmc_k9_b16_lognormal");
+    Config config = research_default_config();
     IncrementalKmcBeam model{
         config, ConstraintMode::SoftLength, OptimizationMode::FinalOnlyExact, 0};
 };
@@ -1552,8 +2313,101 @@ void AcorKernel::reset(int design_length) {
     impl_->model.reset(design_length);
 }
 
+void AcorKernel::reserve_evidence(std::size_t read_count) {
+    impl_->model.reserve_evidence(read_count);
+}
+
 AcorIncrementalResult AcorKernel::add_read(const std::string& sequence, bool is_last) {
     const ConsensusResult observed = impl_->model.add_read(sequence, is_last);
+    AcorIncrementalResult output;
+    output.final_decode_seconds = observed.final_decode_seconds;
+    output.ranked.reserve(observed.ranked.size());
+    for (const Candidate& candidate : observed.ranked) {
+        output.ranked.push_back({candidate.sequence, candidate.score});
+    }
+    return output;
+}
+
+void AcorKernel::add_read_evidence_only(const std::string& sequence) {
+    impl_->model.add_read_evidence_only(sequence);
+}
+
+void AcorKernel::add_read_graph_atomic(const std::string& sequence) {
+    impl_->model.add_read_graph_atomic(sequence);
+}
+
+void AcorKernel::enable_hot_cache() {
+    impl_->model.enable_hot_cache();
+}
+
+void AcorKernel::flush_pending_hot_cache() {
+    impl_->model.flush_pending_hot_cache();
+}
+
+void AcorKernel::enable_atomic_updates() {
+    impl_->model.enable_atomic_updates();
+}
+
+void AcorKernel::flush_atomic_updates() {
+    impl_->model.flush_atomic_updates();
+}
+
+void AcorKernel::append_evidence_deltas(
+    const std::string& sequence, std::vector<AcorCounterDelta>& output) const {
+    impl_->model.append_evidence_deltas(sequence, output);
+}
+
+void AcorKernel::merge_evidence_from(const AcorKernel& other) {
+    impl_->model.merge_evidence_from(other.impl_->model);
+}
+
+void AcorKernel::merge_counter_range_from(
+    const AcorKernel& other, std::size_t shard, std::size_t shard_count) {
+    impl_->model.merge_counter_range_from(other.impl_->model, shard, shard_count);
+}
+
+void AcorKernel::merge_counter_sparse_range_from(
+    const AcorKernel& other, std::size_t shard, std::size_t shard_count) {
+    impl_->model.merge_counter_sparse_range_from(other.impl_->model, shard, shard_count);
+}
+
+void AcorKernel::finalize_counter_range_merge() {
+    impl_->model.finalize_counter_range_merge();
+}
+
+void AcorKernel::merge_evidence_metadata_from(const AcorKernel& other) {
+    impl_->model.merge_evidence_metadata_from(other.impl_->model);
+}
+
+void AcorKernel::apply_counter_deltas(const std::vector<AcorCounterDelta>& deltas) {
+    impl_->model.apply_counter_deltas(deltas);
+}
+
+void AcorKernel::apply_counter_tile(
+    std::uint8_t kind, std::uint32_t begin, const std::uint32_t* counts,
+    std::size_t count) {
+    impl_->model.apply_counter_tile(kind, begin, counts, count);
+}
+
+void AcorKernel::finalize_counter_deltas() {
+    impl_->model.finalize_counter_deltas();
+}
+
+void AcorKernel::merge_sparse_metadata(
+    const std::vector<std::pair<std::string, std::uint32_t>>& read_counts,
+    const std::vector<int>& lengths,
+    std::size_t reads_arrived,
+    std::size_t exact_m_read_count,
+    double log_length_sum,
+    double log_length_sq_sum,
+    std::uint64_t total_start_observations) {
+    impl_->model.merge_sparse_metadata(
+        read_counts, lengths, reads_arrived, exact_m_read_count,
+        log_length_sum, log_length_sq_sum, total_start_observations);
+}
+
+AcorIncrementalResult AcorKernel::decode_final() {
+    const ConsensusResult observed = impl_->model.decode_final();
     AcorIncrementalResult output;
     output.final_decode_seconds = observed.final_decode_seconds;
     output.ranked.reserve(observed.ranked.size());
@@ -1571,8 +2425,16 @@ double AcorKernel::beam_decode_seconds() const {
     return impl_->model.beam_decode_seconds();
 }
 
+bool AcorKernel::uses_sparse_ledger() const {
+    return impl_->model.uses_sparse_ledger();
+}
+
 std::string acor_canonical(const std::string& sequence) {
     return canonical(sequence);
+}
+
+void acor_canonical_into(const std::string& sequence, std::string& output) {
+    canonical_into(sequence, output);
 }
 
 void acor_edit_distance_self_test() {
