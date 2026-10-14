@@ -26,7 +26,7 @@ pairs had identical prediction-file SHA-256 values, Exact, Accuracy, and
 Mean ED. These comparisons establish output compatibility on the tested
 inputs and configurations.
 
-At P1, v0.2.0 runner times were higher in all eight datasets, with a median
+At P1, v0.2.0 runner times were higher in all eight datasets, with a mean
 increase of about 4.8%. At P20, the median old/new runner-time ratio was
 1.17. The three largest workloads had ratios close to 1.00.
 The P20 measurements are:
@@ -43,9 +43,7 @@ The P20 measurements are:
 | Zenodo 10943282 | 5.078 | 5.039 | 1.01x |
 
 Seven of eight P40 runner measurements favored v0.2.0. The recorded Oligo0
-P40 row favored v0.1.0. A separate five-order paired comparison reported
-mean runner times of 0.377 s and 0.218 s, respectively, giving a 1.73x ratio.
-That comparison remains separate from the one-observation matrix.
+P40 row favored v0.1.0.
 
 Compute times were higher for v0.2.0 at every tested default-k worker
 configuration. Runner and compute measurements therefore describe different
